@@ -1,2 +1,2 @@
 #!/usr/bin/env node
-import './transport.js';
+import './server.js';

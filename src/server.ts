@@ -1,4 +1,5 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
     ListToolsRequestSchema,
     CallToolRequestSchema,
@@ -8,11 +9,19 @@ import {
     Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import axios, { AxiosError, Method } from 'axios';
+import express from "express";
+import { Request, Response, NextFunction } from 'express';
 import * as console from 'console';
+
+const app = express();
 
 // Environment variables are loaded by the main index.ts
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.ahrefs.com/v3';
 const API_KEY = process.env.API_KEY;
+const axiosInstance = axios.create({
+    baseURL: API_BASE_URL, // Axios will use this as the base for requests
+    timeout: 30000, // 30 second timeout
+});
 
 const tools: Tool[] = [
     {
@@ -5341,174 +5350,179 @@ function mapApiErrorToMcpError(error: unknown): McpError {
     }
 }
 
+process.on('SIGINT', async () => {
+    console.error("Received SIGINT, shutting down server...");
+    await server.close();
+    console.error("Server closed.");
+    process.exit(0);
+});
+process.on('SIGTERM', async () => {
+    console.error("Received SIGTERM, shutting down server...");
+    await server.close();
+    console.error("Server closed.");
+    process.exit(0);
+});
 
-export class OpenApiMcpServer {
-    public server: Server; // Make server public for transport connection
-    private axiosInstance = axios.create({
-        baseURL: API_BASE_URL, // Axios will use this as the base for requests
-        timeout: 30000, // 30 second timeout
+const server = new Server(
+  {
+    name: "ahrefs-mcp-server",
+    version: "1.0.0",
+  },
+  {
+    capabilities: {
+        tools: {},
+    },
+  },
+);
+
+let transport: SSEServerTransport | null = null;
+
+app.get("/sse", (req: Request, res: Response) => {
+  transport = new SSEServerTransport("/messages", res);
+  server.connect(transport).then(() => {
+        console.error("MCP server connected via SSE and running.");
+        console.error("MCP_SERVER_READY");
+    })
+    .catch(error => {
+        console.error("Failed to connect MCP server via SSE:", error);
+        process.exit(1);
     });
+});
 
-    constructor() {
-        console.error(`Initializing MCP Server: ahrefs v3.0.0`);
-        console.error(`Using API Base URL: ${API_BASE_URL}`);
-        if (!API_KEY) {
-            console.error("No API Key found. Assuming public API or auth handled differently.");
+app.post("/messages", (req: Request, res: Response) => {
+  if (transport) {
+    transport.handlePostMessage(req, res);
+  }
+});
+
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+    console.error("Handling ListTools request");
+    return { tools };
+});
+
+server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
+    const toolName = request.params.name;
+    const args = request.params.arguments || {};
+    console.error(`Received CallTool request for: ${toolName}`, args);
+
+    if (toolName === "doc") {
+        const requestedToolName = String(args.tool).split('_').pop();
+        const requestedTool = tools.find(t => t.name === requestedToolName);
+        if (!requestedTool) {
+            console.error(`Tool not found: ${requestedToolName}`);
+            throw new McpError(ErrorCode.MethodNotFound, `Tool '${requestedToolName}' not found.`);
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(requestedTool._inputSchema, null, 2) }] };
+    }
+
+    const tool = tools.find(t => t.name === toolName);
+    if (!tool) {
+        console.error(`Tool not found: ${toolName}`);
+        throw new McpError(ErrorCode.MethodNotFound, `Tool '${toolName}' not found.`);
+    }
+
+    // Retrieve original OpenAPI details attached during generation
+    const originalMethod = (tool as any)._original_method as Method; // Cast to Axios Method type
+    const originalPath = (tool as any)._original_path as string;
+    const originalParameters = (tool as any)._original_parameters as any[] || [];
+    const originalRequestBodyInfo = (tool as any)._original_request_body as { required: boolean, content_type: string | null } | null;
+
+    if (!originalMethod || !originalPath) {
+        console.error(`Missing original operation details for tool: ${toolName}`);
+        throw new McpError(ErrorCode.InternalError, `Internal configuration error for tool '${toolName}'.`);
+    }
+
+    try {
+        let targetPath = originalPath;
+        const queryParams: Record<string, any> = {};
+        const headers: Record<string, string> = {
+            'Accept': 'application/json',
+            'User-Agent': 'ahrefs-mcp-server'
+        };
+        let requestData: any = undefined;
+        let requestBody: any = args.requestBody;
+        headers["Authorization"] = `Bearer ${API_KEY}`;
+
+        // Process parameters based on their 'in' location
+        for (const param of originalParameters) {
+            const paramName = param.name;
+            const paramIn = param.in; // path, query, header
+            let paramValue = args[paramName];
+
+            // Lowercase specific parameters
+            if (paramValue !== undefined && paramValue !== null && ["us_state", "country", "country_code"].includes(paramName)) {
+                paramValue = String(paramValue).toLowerCase();
+            }
+
+            if (paramValue !== undefined && paramValue !== null) {
+                if (paramIn === 'path') {
+                    targetPath = targetPath.replace(`{${paramName}}`, encodeURIComponent(String(paramValue)));
+                } else if (paramIn === 'query') {
+                    queryParams[paramName] = paramValue;
+                } else if (paramIn === 'header') {
+                    headers[paramName] = String(paramValue);
+                } else if (paramIn === 'body') {
+                    if (!requestBody) {
+                        requestBody = {};
+                    }
+                    requestBody[paramName] = paramValue;
+                }
+            } else if (param.required) {
+                console.error(`Missing required parameter '${paramName}' for tool ${toolName}`);
+                throw new McpError(ErrorCode.InvalidParams, `Missing required parameter: ${paramName}`);
+            }
         }
 
-        this.server = new Server(
-            { name: 'ahrefs', version: '3.0.0' },
-            { capabilities: { resources: {}, tools: {} } }
-        );
-        this.setupRequestHandlers();
-        this.setupGracefulShutdown();
-        this.server.onerror = (error) => console.error('[MCP Server Error]', error);
-    }
+        // Process requestBody
+        if (originalRequestBodyInfo && requestBody !== undefined && requestBody !== null) {
+            requestData = requestBody;
+            headers['Content-Type'] = originalRequestBodyInfo.content_type || 'application/json';
+        } else if (originalRequestBodyInfo?.required) {
+            console.error(`Missing required requestBody for tool ${toolName}`);
+            throw new McpError(ErrorCode.InvalidParams, `Missing required requestBody`);
+        } else if (requestData !== undefined) {
+            headers['Content-Type'] = 'application/json';
+        }
 
-    private setupGracefulShutdown(): void {
-        process.on('SIGINT', async () => {
-            console.error("Received SIGINT, shutting down server...");
-            await this.server.close();
-            console.error("Server closed.");
-            process.exit(0);
-        });
-        process.on('SIGTERM', async () => {
-            console.error("Received SIGTERM, shutting down server...");
-            await this.server.close();
-            console.error("Server closed.");
-            process.exit(0);
-        });
-    }
-
-    private setupRequestHandlers(): void {
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-            console.error("Handling ListTools request");
-            return { tools };
+        // Make API Call - Axios combines baseURL and url
+        const requestUrl = targetPath; // Use the path directly
+        console.error(`Making API call: ${originalMethod} ${axiosInstance.defaults.baseURL}${requestUrl}`);
+        const response = await axiosInstance.request({
+            method: originalMethod,
+            url: requestUrl, // Use the relative path; Axios combines it with baseURL
+            params: queryParams,
+            headers: headers,
+            data: requestData,
+            validateStatus: (status: number) => status >= 200 && status < 300, // Only 2xx are considered success
         });
 
-        this.server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
-            const toolName = request.params.name;
-            const args = request.params.arguments || {};
-            console.error(`Received CallTool request for: ${toolName}`, args);
+        console.error(`API call successful for ${toolName}, Status: ${response.status}`);
 
-            if (toolName === "doc") {
-                const requestedToolName = String(args.tool).split('_').pop();
-                const requestedTool = tools.find(t => t.name === requestedToolName);
-                if (!requestedTool) {
-                    console.error(`Tool not found: ${requestedToolName}`);
-                    throw new McpError(ErrorCode.MethodNotFound, `Tool '${requestedToolName}' not found.`);
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(requestedTool._inputSchema, null, 2) }] };
-            }
-
-            const tool = tools.find(t => t.name === toolName);
-            if (!tool) {
-                console.error(`Tool not found: ${toolName}`);
-                throw new McpError(ErrorCode.MethodNotFound, `Tool '${toolName}' not found.`);
-            }
-
-            // Retrieve original OpenAPI details attached during generation
-            const originalMethod = (tool as any)._original_method as Method; // Cast to Axios Method type
-            const originalPath = (tool as any)._original_path as string;
-            const originalParameters = (tool as any)._original_parameters as any[] || [];
-            const originalRequestBodyInfo = (tool as any)._original_request_body as { required: boolean, content_type: string | null } | null;
-
-            if (!originalMethod || !originalPath) {
-                console.error(`Missing original operation details for tool: ${toolName}`);
-                throw new McpError(ErrorCode.InternalError, `Internal configuration error for tool '${toolName}'.`);
-            }
-
+        // Format Response for MCP
+        let responseText: string;
+        const responseContentType = response.headers['content-type'];
+        if (responseContentType && responseContentType.includes('application/json') && typeof response.data === 'object') {
             try {
-                let targetPath = originalPath;
-                const queryParams: Record<string, any> = {};
-                const headers: Record<string, string> = {
-                    'Accept': 'application/json',
-                    'User-Agent': 'ahrefs-mcp-server'
-                };
-                let requestData: any = undefined;
-                let requestBody: any = args.requestBody;
-                headers["Authorization"] = `Bearer ${API_KEY}`;
-
-                // Process parameters based on their 'in' location
-                for (const param of originalParameters) {
-                    const paramName = param.name;
-                    const paramIn = param.in; // path, query, header
-                    let paramValue = args[paramName];
-
-                    // Lowercase specific parameters
-                    if (paramValue !== undefined && paramValue !== null && ["us_state", "country", "country_code"].includes(paramName)) {
-                        paramValue = String(paramValue).toLowerCase();
-                    }
-
-                    if (paramValue !== undefined && paramValue !== null) {
-                        if (paramIn === 'path') {
-                            targetPath = targetPath.replace(`{${paramName}}`, encodeURIComponent(String(paramValue)));
-                        } else if (paramIn === 'query') {
-                            queryParams[paramName] = paramValue;
-                        } else if (paramIn === 'header') {
-                            headers[paramName] = String(paramValue);
-                        } else if (paramIn === 'body') {
-                            if (!requestBody) {
-                                requestBody = {};
-                            }
-                            requestBody[paramName] = paramValue;
-                        }
-                    } else if (param.required) {
-                        console.error(`Missing required parameter '${paramName}' for tool ${toolName}`);
-                        throw new McpError(ErrorCode.InvalidParams, `Missing required parameter: ${paramName}`);
-                    }
-                }
-
-                // Process requestBody
-                if (originalRequestBodyInfo && requestBody !== undefined && requestBody !== null) {
-                    requestData = requestBody;
-                    headers['Content-Type'] = originalRequestBodyInfo.content_type || 'application/json';
-                } else if (originalRequestBodyInfo?.required) {
-                    console.error(`Missing required requestBody for tool ${toolName}`);
-                    throw new McpError(ErrorCode.InvalidParams, `Missing required requestBody`);
-                } else if (requestData !== undefined) {
-                    headers['Content-Type'] = 'application/json';
-                }
-
-                // Make API Call - Axios combines baseURL and url
-                const requestUrl = targetPath; // Use the path directly
-                console.error(`Making API call: ${originalMethod} ${this.axiosInstance.defaults.baseURL}${requestUrl}`);
-                const response = await this.axiosInstance.request({
-                    method: originalMethod,
-                    url: requestUrl, // Use the relative path; Axios combines it with baseURL
-                    params: queryParams,
-                    headers: headers,
-                    data: requestData,
-                    validateStatus: (status) => status >= 200 && status < 300, // Only 2xx are considered success
-                });
-
-                console.error(`API call successful for ${toolName}, Status: ${response.status}`);
-
-                // Format Response for MCP
-                let responseText: string;
-                const responseContentType = response.headers['content-type'];
-                if (responseContentType && responseContentType.includes('application/json') && typeof response.data === 'object') {
-                    try {
-                        responseText = JSON.stringify(response.data, null, 2); // Pretty-print JSON
-                    } catch (e) {
-                        console.error("Failed to stringify JSON response, returning as string.", e);
-                        responseText = String(response.data);
-                    }
-                } else {
-                    responseText = String(response.data); // Return non-JSON as plain text
-                }
-
-                return { content: [{ type: 'text', text: responseText }] };
-
-            } catch (error) {
-                console.error(`Error during API call for tool ${toolName}:`, error);
-                const mcpError = mapApiErrorToMcpError(error);
-                return {
-                    content: [{ type: 'text', text: mcpError.message }],
-                    isError: true,
-                    error: mcpError, // Include structured error
-                };
+                responseText = JSON.stringify(response.data, null, 2); // Pretty-print JSON
+            } catch (e) {
+                console.error("Failed to stringify JSON response, returning as string.", e);
+                responseText = String(response.data);
             }
-        });
+        } else {
+            responseText = String(response.data); // Return non-JSON as plain text
+        }
+
+        return { content: [{ type: 'text', text: responseText }] };
+
+    } catch (error) {
+        console.error(`Error during API call for tool ${toolName}:`, error);
+        const mcpError = mapApiErrorToMcpError(error);
+        return {
+            content: [{ type: 'text', text: mcpError.message }],
+            isError: true,
+            error: mcpError, // Include structured error
+        };
     }
-}
+});
+
+app.listen(3000);
