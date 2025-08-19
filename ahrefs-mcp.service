@@ -1,0 +1,30 @@
+[Unit]
+Description=Ahrefs MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=SERVER_USER
+WorkingDirectory=DEPLOY_PATH
+ExecStart=/usr/bin/node build/index.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=NODE_ENV
+Environment=API_BASE_URL=API_BASE_URL
+Environment=API_KEY=API_KEY
+Environment=PORT=PORT
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ahrefs-mcp
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=DEPLOY_PATH
+
+[Install]
+WantedBy=multi-user.target
